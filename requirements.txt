@@ -1,0 +1,15 @@
+# HGA-LSTM Requirements
+# Python 3.10+
+# MSI RTX 5070 — CUDA 12.x рекомендовано
+
+# PyTorch з підтримкою CUDA 12.x
+# Встановіть вручну з офіційного сайту:
+#   https://pytorch.org/get-started/locally/
+# Команда для RTX 5070 (CUDA 12.4):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+torch>=2.3.0
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.13.0
+matplotlib>=3.8.0
