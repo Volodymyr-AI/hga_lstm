@@ -1,17 +1,21 @@
 """
-HGA-LSTM: Hybrid Genetic Algorithm + LSTM для прогнозування щільності пульпи
-та ефективності грохочення залізорудної пульпи.
+hga_lstm.py — Hybrid Genetic Algorithm + LSTM (HGA-LSTM)
 
-Реалізація на основі методології Zou et al., поєднує:
-  - Генетичний алгоритм (GA) для глобального пошуку гіперпараметрів
-  - Sequential Quadratic Programming (SQP) для локального уточнення
-  - LSTM мережу для часових рядів
+Implementation based on Zou et al. methodology for predicting
+iron ore pulp density and screening efficiency.
 
-Референс: Zou et al. - HGA-LSTM model for pulp density prediction
-          RMSE: 3.83 → 3.08 (-19.5%), ARGE: 0.119 → 0.0752 (-36.8%)
+Reference:
+    Zou G. et al. An HGA-LSTM-Based Intelligent Model for Ore Pulp Density
+    in the Hydrometallurgical Process. Materials. 2022. Vol. 15, No. 21. Article 7586.
+    Results: RMSE 3.83 -> 3.08 (-19.5%), ARGE 0.119 -> 0.0752 (-36.8%)
 
-Автор: [Ваше ім'я]
-Дата: 2025
+Architecture:
+    Phase 1 - Genetic Algorithm: global search over 6D hyperparameter space
+    Phase 2 - SQP (L-BFGS-B):   local refinement of best GA solution
+    Phase 3 - LSTM training:     final model with optimal hyperparameters
+
+Authors: Moiseichenko V.V., Savytskyi O.I.
+         Kryvyi Rih National University, 2025
 """
 
 from __future__ import annotations
@@ -21,9 +25,8 @@ import logging
 import random
 import time
 import warnings
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
@@ -33,107 +36,97 @@ from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore")
 
-# ─── Логування ────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 log = logging.getLogger("HGA-LSTM")
 
 
-# ─── Конфігурація ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Hyperparameter search space
+# Defined as module-level constant (NOT inside dataclass) to allow
+# access as HP_BOUNDS without instantiating HyperParams()
+# ---------------------------------------------------------------------------
+HP_BOUNDS: list[tuple[float, float]] = [
+    (16.0,  256.0),   # hidden_size:    LSTM hidden units
+    (1.0,   4.0),     # num_layers:     stacked LSTM layers
+    (0.0,   0.5),     # dropout:        regularization rate
+    (1e-5,  0.1),     # learning_rate:  Adam optimizer LR
+    (8.0,   128.0),   # batch_size:     mini-batch size
+    (5.0,   50.0),    # seq_len:        lookback window length
+]
+
 
 @dataclass
 class HyperParams:
-    """Гіперпараметри LSTM мережі, що оптимізуються GA+SQP."""
-    hidden_size: int = 64           # Розмір прихованого шару [32, 256]
-    num_layers: int = 2             # Кількість LSTM шарів [1, 4]
-    dropout: float = 0.2            # Dropout між шарами [0.0, 0.5]
-    learning_rate: float = 1e-3     # Швидкість навчання [1e-5, 1e-1]
-    batch_size: int = 32            # Розмір батчу [8, 128]
-    seq_len: int = 10               # Довжина вхідної послідовності [5, 50]
+    """
+    LSTM hyperparameters optimized by GA + SQP.
+    6D search space: theta = {hidden_size, num_layers, dropout, lr, batch_size, seq_len}
+    """
+    hidden_size:   int   = 64
+    num_layers:    int   = 2
+    dropout:       float = 0.2
+    learning_rate: float = 1e-3
+    batch_size:    int   = 32
+    seq_len:       int   = 10
 
     def to_vector(self) -> np.ndarray:
-        """Кодує гіперпараметри у вектор для GA/SQP."""
+        """Encode as float vector for GA/SQP."""
         return np.array([
-            self.hidden_size,
-            self.num_layers,
-            self.dropout,
-            self.learning_rate,
-            self.batch_size,
-            self.seq_len,
+            self.hidden_size, self.num_layers, self.dropout,
+            self.learning_rate, self.batch_size, self.seq_len,
         ], dtype=float)
 
     @classmethod
     def from_vector(cls, v: np.ndarray) -> "HyperParams":
-        """Декодує вектор у гіперпараметри з округленням цілих значень."""
+        """Decode float vector back to HyperParams (rounds integer fields)."""
         return cls(
-            hidden_size=max(8, int(round(v[0]))),
-            num_layers=max(1, min(4, int(round(v[1])))),
-            dropout=float(np.clip(v[2], 0.0, 0.5)),
+            hidden_size=max(8,   int(round(v[0]))),
+            num_layers= max(1,   min(4,   int(round(v[1])))),
+            dropout=    float(np.clip(v[2], 0.0, 0.5)),
             learning_rate=float(np.clip(v[3], 1e-5, 0.1)),
-            batch_size=max(4, int(round(v[4]))),
-            seq_len=max(3, min(100, int(round(v[5])))),
+            batch_size= max(4,   int(round(v[4]))),
+            seq_len=    max(3,   min(100, int(round(v[5])))),
         )
-
-    # ── Межі для GA ──
-    BOUNDS: list[tuple[float, float]] = field(default_factory=lambda: [
-        (16.0, 256.0),   # hidden_size
-        (1.0,  4.0),     # num_layers
-        (0.0,  0.5),     # dropout
-        (1e-5, 0.1),     # learning_rate
-        (8.0,  128.0),   # batch_size
-        (5.0,  50.0),    # seq_len
-    ])
 
 
 @dataclass
 class GAConfig:
-    """Конфігурація генетичного алгоритму."""
-    population_size: int = 20       # Розмір популяції
-    n_generations: int = 30         # Кількість поколінь
-    crossover_prob: float = 0.8     # Ймовірність схрещування
-    mutation_prob: float = 0.15     # Ймовірність мутації
-    mutation_scale: float = 0.1     # Масштаб мутації (відносний)
-    elitism_count: int = 2          # Кількість елітних особин
-    tournament_k: int = 3           # Розмір турніру
+    """Genetic Algorithm configuration."""
+    population_size: int   = 20
+    n_generations:   int   = 30
+    crossover_prob:  float = 0.8
+    mutation_prob:   float = 0.15
+    mutation_scale:  float = 0.1
+    elitism_count:   int   = 2
+    tournament_k:    int   = 3
 
 
 @dataclass
 class TrainConfig:
-    """Конфігурація навчання LSTM."""
-    epochs: int = 100
-    patience: int = 15              # Early stopping patience
-    min_delta: float = 1e-6
-    device: str = "auto"            # "auto", "cuda", "cpu"
-    seed: int = 42
-    save_dir: str = "checkpoints"
-    sqp_refine: bool = True         # Уточнення SQP після GA
+    """LSTM training configuration."""
+    epochs:     int   = 100
+    patience:   int   = 15
+    min_delta:  float = 1e-6
+    device:     str   = "auto"
+    seed:       int   = 42
+    sqp_refine: bool  = True
 
 
-# ─── LSTM модель ──────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# LSTM model
+# ---------------------------------------------------------------------------
 
 class LSTMRegressor(nn.Module):
     """
-    Багатошарова LSTM мережа для прогнозування часових рядів.
+    Multi-layer LSTM for time-series regression.
 
-    Архітектура:
-        Input → LSTM × num_layers → Dropout → FC → Output
+    Architecture: Input [B,T,F] -> LSTM x L -> Dropout -> FC -> Output [B,1]
 
-    Рівняння (згідно з дисертацією):
-        f_t = σ(W_f · [h_{t-1}, x_t] + b_f)   — вентиль забування
-        i_t = σ(W_i · [h_{t-1}, x_t] + b_i)   — вхідний вентиль
-        C̃_t = tanh(W_C · [h_{t-1}, x_t] + b_C) — кандидат стану
-        C_t = f_t ⊙ C_{t-1} + i_t ⊙ C̃_t       — стан комірки
-        o_t = σ(W_o · [h_{t-1}, x_t] + b_o)   — вихідний вентиль
-        h_t = o_t * tanh(C_t)                  — прихований стан
-
-    Args:
-        input_size:  Кількість вхідних ознак
-        output_size: Кількість виходів (1 для щільності пульпи)
-        hp:          Гіперпараметри (HyperParams)
+    LSTM equations (Hochreiter & Schmidhuber, 1997):
+        f_t = sigma(W_f [h_{t-1}, x_t] + b_f)       forget gate
+        i_t = sigma(W_i [h_{t-1}, x_t] + b_i)       input gate
+        C_t_tilde = tanh(W_C [h_{t-1}, x_t] + b_C)  cell candidate
+        C_t = f_t * C_{t-1} + i_t * C_t_tilde        cell state update
+        o_t = sigma(W_o [h_{t-1}, x_t] + b_o)        output gate
+        h_t = o_t * tanh(C_t)                         hidden state output
     """
 
     def __init__(self, input_size: int, output_size: int, hp: HyperParams):
@@ -150,22 +143,21 @@ class LSTMRegressor(nn.Module):
         self.fc = nn.Linear(hp.hidden_size, output_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor [batch, seq_len, input_size]
-        Returns:
-            out: Tensor [batch, output_size]
-        """
-        lstm_out, _ = self.lstm(x)          # [B, T, H]
-        last_step = lstm_out[:, -1, :]      # [B, H]
-        out = self.fc(self.dropout(last_step))
-        return out
+        lstm_out, _ = self.lstm(x)
+        last_step = lstm_out[:, -1, :]     # use only last time step
+        return self.fc(self.dropout(last_step))
 
 
-# ─── Утиліти даних ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Min-Max scaler
+# ---------------------------------------------------------------------------
 
 class MinMaxScaler:
-    """Нормалізація Min-Max з підтримкою inverse_transform."""
+    """
+    Feature-wise Min-Max normalization to [0, 1].
+    Epsilon avoids division by zero for constant features.
+    """
+    EPS = 1e-9
 
     def __init__(self):
         self.min_: np.ndarray | None = None
@@ -177,16 +169,22 @@ class MinMaxScaler:
         return self._scale(X)
 
     def transform(self, X: np.ndarray) -> np.ndarray:
-        assert self.min_ is not None, "Scaler not fitted"
+        if self.min_ is None:
+            raise RuntimeError("Scaler not fitted")
         return self._scale(X)
 
     def inverse_transform(self, X: np.ndarray) -> np.ndarray:
-        assert self.min_ is not None, "Scaler not fitted"
-        return X * (self.max_ - self.min_ + 1e-9) + self.min_
+        if self.min_ is None:
+            raise RuntimeError("Scaler not fitted")
+        return X * (self.max_ - self.min_ + self.EPS) + self.min_
 
     def _scale(self, X: np.ndarray) -> np.ndarray:
-        return (X - self.min_) / (self.max_ - self.min_ + 1e-9)
+        return (X - self.min_) / (self.max_ - self.min_ + self.EPS)
 
+
+# ---------------------------------------------------------------------------
+# Sliding-window sequence builder
+# ---------------------------------------------------------------------------
 
 def make_sequences(
     data: np.ndarray,
@@ -194,25 +192,29 @@ def make_sequences(
     seq_len: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Створює ковзні вікна для часових рядів.
+    Build overlapping sliding-window sequences for LSTM input.
 
-    Args:
-        data:    [N, features] — нормалізовані вхідні дані
-        targets: [N]           — цільова змінна
-        seq_len: довжина вікна
+    For each index i in [0, N-seq_len):
+        X[i] = data[i : i+seq_len]     shape [seq_len, features]
+        y[i] = targets[i + seq_len]    next-step target
 
     Returns:
         X: [N-seq_len, seq_len, features]
         y: [N-seq_len]
     """
-    X, y = [], []
+    X_list, y_list = [], []
     for i in range(len(data) - seq_len):
-        X.append(data[i : i + seq_len])
-        y.append(targets[i + seq_len])
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+        X_list.append(data[i: i + seq_len])
+        y_list.append(targets[i + seq_len])
+    return (
+        np.array(X_list, dtype=np.float32),
+        np.array(y_list, dtype=np.float32),
+    )
 
 
-# ─── Навчання та оцінка ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
 
 def train_evaluate(
     hp: HyperParams,
@@ -223,219 +225,210 @@ def train_evaluate(
     cfg: TrainConfig,
     device: torch.device,
     verbose: bool = False,
-) -> tuple[float, LSTMRegressor]:
+) -> tuple[float, LSTMRegressor | None]:
     """
-    Навчає LSTM з даними гіперпараметрами та повертає (val_rmse, модель).
+    Train LSTM with given hyperparameters, return (val_rmse, model).
 
-    Оптимізатор Adam:
-        m_t = β₁·m_{t-1} + (1-β₁)·∇L
-        v_t = β₂·v_{t-1} + (1-β₂)·∇L²
-        θ_t = θ_{t-1} - α · m̂_t / (√v̂_t + ε)
-        де β₁=0.9, β₂=0.999, ε=1e-8
+    Adam optimizer update rule:
+        m_t = beta1*m_{t-1} + (1-beta1)*grad_L
+        v_t = beta2*v_{t-1} + (1-beta2)*grad_L^2
+        theta_t = theta_{t-1} - lr * m_hat_t / (sqrt(v_hat_t) + eps)
+    with beta1=0.9, beta2=0.999, eps=1e-8.
+
+    Gradient clipping (max_norm=1.0) prevents exploding gradients.
+    ReduceLROnPlateau halves LR when val_rmse stalls for 5 epochs.
 
     Returns:
-        val_rmse: RMSE на валідаційній вибірці
-        model:    Навчена модель
+        (inf, None) if training failed (e.g. insufficient data for batch)
+        (best_val_rmse, model) on success
     """
     torch.manual_seed(cfg.seed)
     input_size = X_train.shape[-1]
 
-    # Побудова послідовностей
-    Xs_tr, ys_tr = make_sequences(X_train, y_train, hp.seq_len)
-    Xs_val, ys_val = make_sequences(X_val, y_val, hp.seq_len)
+    X_seq_tr,  y_seq_tr  = make_sequences(X_train, y_train, hp.seq_len)
+    X_seq_val, y_seq_val = make_sequences(X_val,   y_val,   hp.seq_len)
 
-    if len(Xs_tr) < hp.batch_size:
+    if len(X_seq_tr) < hp.batch_size:
         return float("inf"), None
 
-    train_ds = TensorDataset(
-        torch.from_numpy(Xs_tr).to(device),
-        torch.from_numpy(ys_tr).unsqueeze(1).to(device),
+    loader = DataLoader(
+        TensorDataset(
+            torch.from_numpy(X_seq_tr).to(device),
+            torch.from_numpy(y_seq_tr).unsqueeze(1).to(device),
+        ),
+        batch_size=hp.batch_size, shuffle=True, drop_last=False,
     )
-    loader = DataLoader(train_ds, batch_size=hp.batch_size, shuffle=True)
 
     model = LSTMRegressor(input_size, 1, hp).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=hp.learning_rate,
-                                 betas=(0.9, 0.999), eps=1e-8)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=hp.learning_rate,
+        betas=(0.9, 0.999), eps=1e-8,
+    )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=5, factor=0.5, verbose=False
+        optimizer, mode="min", patience=5, factor=0.5, verbose=False,
     )
     criterion = nn.MSELoss()
 
-    best_val_loss = float("inf")
-    patience_cnt = 0
-    best_state = None
+    best_val_rmse = float("inf")
+    patience_cnt  = 0
+    best_state:   dict | None = None
 
     for epoch in range(cfg.epochs):
         model.train()
         for xb, yb in loader:
             optimizer.zero_grad()
-            pred = model(xb)
-            loss = criterion(pred, yb)
+            loss = criterion(model(xb), yb)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-        # Валідація
         model.eval()
         with torch.no_grad():
-            xv = torch.from_numpy(Xs_val).to(device)
-            pv = model(xv).cpu().numpy().flatten()
-            val_rmse = float(np.sqrt(np.mean((pv - ys_val) ** 2)))
+            preds = model(torch.from_numpy(X_seq_val).to(device))
+            val_rmse = float(np.sqrt(np.mean(
+                (preds.cpu().numpy().flatten() - y_seq_val) ** 2
+            )))
 
         scheduler.step(val_rmse)
 
-        if val_rmse < best_val_loss - cfg.min_delta:
-            best_val_loss = val_rmse
-            patience_cnt = 0
+        if verbose and (epoch + 1) % 20 == 0:
+            log.info(f"  Epoch {epoch+1:4d}/{cfg.epochs} | val_rmse={val_rmse:.4f}")
+
+        if val_rmse < best_val_rmse - cfg.min_delta:
+            best_val_rmse = val_rmse
+            patience_cnt  = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
         else:
             patience_cnt += 1
             if patience_cnt >= cfg.patience:
                 if verbose:
-                    log.debug(f"  Early stop @ epoch {epoch+1}")
+                    log.info(f"  Early stopping at epoch {epoch + 1}")
                 break
 
-    if best_state:
+    if best_state is not None:
         model.load_state_dict(best_state)
 
-    return best_val_loss, model
+    return best_val_rmse, model
 
 
-# ─── Генетичний алгоритм ──────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Genetic Algorithm
+# ---------------------------------------------------------------------------
 
 class GeneticAlgorithm:
     """
-    Генетичний алгоритм для оптимізації гіперпараметрів LSTM.
+    GA for LSTM hyperparameter optimization.
 
-    Оператори:
-      - Турнірна селекція
-      - SBX схрещування (Simulated Binary Crossover)
-      - Гаусівська мутація
-      - Елітизм
+    Operators:
+        Selection : Tournament (size k=3)
+        Crossover : Simulated Binary Crossover — SBX (eta=2)
+        Mutation  : Gaussian with adaptive scale
+        Elitism   : Top-2 preserved unconditionally each generation
 
-    Args:
-        bounds: Список кортежів (min, max) для кожного параметра
-        ga_cfg: Конфігурація GA
+    SBX spread factor beta:
+        if u <= 0.5: beta = (2u)^{1/(eta+1)}
+        else:        beta = (1/(2*(1-u)))^{1/(eta+1)}
+        c1 = 0.5 * [(1+beta)*p1 + (1-beta)*p2]
+        c2 = 0.5 * [(1-beta)*p1 + (1+beta)*p2]
     """
 
     def __init__(self, bounds: list[tuple[float, float]], ga_cfg: GAConfig):
         self.bounds = np.array(bounds)
-        self.cfg = ga_cfg
-        self.dim = len(bounds)
-        self._best_individual: np.ndarray | None = None
+        self.cfg    = ga_cfg
+        self.dim    = len(bounds)
+        self._best_vector:  np.ndarray | None = None
         self._best_fitness: float = float("inf")
         self.history: list[dict] = []
 
     def _init_population(self) -> np.ndarray:
-        """Ініціалізує популяцію рівномірно в межах bounds."""
-        pop = np.random.uniform(
-            low=self.bounds[:, 0],
-            high=self.bounds[:, 1],
+        return np.random.uniform(
+            self.bounds[:, 0], self.bounds[:, 1],
             size=(self.cfg.population_size, self.dim),
         )
-        return pop
 
-    def _tournament_select(self, fitness: np.ndarray) -> np.ndarray:
-        """Турнірна селекція: обирає кращого з k випадкових."""
+    def _tournament_select(self, fitness: np.ndarray) -> int:
         idx = np.random.choice(len(fitness), self.cfg.tournament_k, replace=False)
-        best = idx[np.argmin(fitness[idx])]
-        return best
+        return int(idx[np.argmin(fitness[idx])])
 
-    def _sbx_crossover(self, p1: np.ndarray, p2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """SBX схрещування (η=2)."""
+    def _sbx_crossover(self, p1: np.ndarray, p2: np.ndarray):
         eta = 2.0
         c1, c2 = p1.copy(), p2.copy()
         for i in range(self.dim):
             if random.random() < 0.5:
                 u = random.random()
-                if u <= 0.5:
-                    beta = (2 * u) ** (1 / (eta + 1))
-                else:
-                    beta = (1 / (2 * (1 - u))) ** (1 / (eta + 1))
-                c1[i] = 0.5 * ((1 + beta) * p1[i] + (1 - beta) * p2[i])
-                c2[i] = 0.5 * ((1 - beta) * p1[i] + (1 + beta) * p2[i])
+                b = ((2*u)**(1/(eta+1)) if u <= 0.5
+                     else (1/(2*(1-u)))**(1/(eta+1)))
+                c1[i] = 0.5*((1+b)*p1[i] + (1-b)*p2[i])
+                c2[i] = 0.5*((1-b)*p1[i] + (1+b)*p2[i])
         return c1, c2
 
-    def _mutate(self, individual: np.ndarray) -> np.ndarray:
-        """Гаусівська мутація з адаптивним масштабом."""
-        mutant = individual.copy()
+    def _mutate(self, ind: np.ndarray) -> np.ndarray:
+        mut = ind.copy()
         for i in range(self.dim):
             if random.random() < self.cfg.mutation_prob:
-                scale = self.cfg.mutation_scale * (self.bounds[i, 1] - self.bounds[i, 0])
-                mutant[i] += np.random.normal(0, scale)
-                mutant[i] = np.clip(mutant[i], self.bounds[i, 0], self.bounds[i, 1])
-        return mutant
+                scale = self.cfg.mutation_scale * (self.bounds[i,1] - self.bounds[i,0])
+                mut[i] = np.clip(mut[i] + np.random.normal(0, scale),
+                                 self.bounds[i,0], self.bounds[i,1])
+        return mut
 
-    def _clip(self, individual: np.ndarray) -> np.ndarray:
-        return np.clip(individual, self.bounds[:, 0], self.bounds[:, 1])
+    def _clip(self, v: np.ndarray) -> np.ndarray:
+        return np.clip(v, self.bounds[:, 0], self.bounds[:, 1])
 
     def run(self, fitness_fn) -> np.ndarray:
         """
-        Запускає GA оптимізацію.
-
-        Args:
-            fitness_fn: callable(vector) → float (менше = краще)
-
-        Returns:
-            best_vector: Найкращий знайдений вектор гіперпараметрів
+        Run GA evolution.
+        fitness_fn(vector) -> float, lower is better.
+        Returns best vector found.
         """
-        population = self._init_population()
-        fitness = np.array([fitness_fn(ind) for ind in population])
-
-        log.info(f"GA початок: найкраще RMSE = {fitness.min():.4f}")
+        pop     = self._init_population()
+        fitness = np.array([fitness_fn(ind) for ind in pop])
+        log.info(f"GA start | initial best RMSE: {fitness.min():.4f}")
 
         for gen in range(self.cfg.n_generations):
             t0 = time.time()
-            new_pop = []
+            next_pop: list[np.ndarray] = []
 
-            # Елітизм
+            # Elitism
             elite_idx = np.argsort(fitness)[: self.cfg.elitism_count]
-            for idx in elite_idx:
-                new_pop.append(population[idx].copy())
+            next_pop.extend(pop[i].copy() for i in elite_idx)
 
-            # Відтворення
-            while len(new_pop) < self.cfg.population_size:
-                p1_idx = self._tournament_select(fitness)
-                p2_idx = self._tournament_select(fitness)
-                p1, p2 = population[p1_idx], population[p2_idx]
+            # Reproduction
+            while len(next_pop) < self.cfg.population_size:
+                p1 = pop[self._tournament_select(fitness)]
+                p2 = pop[self._tournament_select(fitness)]
+                c1, c2 = (self._sbx_crossover(p1, p2)
+                          if random.random() < self.cfg.crossover_prob
+                          else (p1.copy(), p2.copy()))
+                next_pop.append(self._clip(self._mutate(c1)))
+                if len(next_pop) < self.cfg.population_size:
+                    next_pop.append(self._clip(self._mutate(c2)))
 
-                if random.random() < self.cfg.crossover_prob:
-                    c1, c2 = self._sbx_crossover(p1, p2)
-                else:
-                    c1, c2 = p1.copy(), p2.copy()
+            pop     = np.array(next_pop)
+            fitness = np.array([fitness_fn(ind) for ind in pop])
 
-                new_pop.append(self._clip(self._mutate(c1)))
-                if len(new_pop) < self.cfg.population_size:
-                    new_pop.append(self._clip(self._mutate(c2)))
-
-            population = np.array(new_pop)
-            fitness = np.array([fitness_fn(ind) for ind in population])
-
-            gen_best = fitness.min()
-            gen_avg = fitness.mean()
-            elapsed = time.time() - t0
+            gen_best = float(fitness.min())
+            gen_avg  = float(fitness.mean())
+            elapsed  = time.time() - t0
 
             if gen_best < self._best_fitness:
                 self._best_fitness = gen_best
-                self._best_individual = population[fitness.argmin()].copy()
+                self._best_vector  = pop[int(fitness.argmin())].copy()
 
             self.history.append({
                 "generation": gen + 1,
-                "best_rmse": float(gen_best),
-                "avg_rmse": float(gen_avg),
-                "elapsed_s": round(elapsed, 2),
+                "best_rmse":  gen_best,
+                "avg_rmse":   gen_avg,
+                "elapsed_s":  round(elapsed, 2),
             })
+            log.info(f"Gen {gen+1:3d}/{self.cfg.n_generations} | "
+                     f"Best: {gen_best:.4f} | Avg: {gen_avg:.4f} | {elapsed:.1f}s")
 
-            log.info(
-                f"Gen {gen+1:3d}/{self.cfg.n_generations} | "
-                f"Best RMSE: {gen_best:.4f} | Avg: {gen_avg:.4f} | "
-                f"{elapsed:.1f}s"
-            )
-
-        return self._best_individual
+        return self._best_vector
 
 
-# ─── SQP Уточнення ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# SQP local refinement
+# ---------------------------------------------------------------------------
 
 def sqp_refine(
     initial_vector: np.ndarray,
@@ -444,177 +437,151 @@ def sqp_refine(
     maxiter: int = 30,
 ) -> np.ndarray:
     """
-    Уточнення рішення GA методом SQP (Sequential Quadratic Programming).
+    L-BFGS-B local refinement of the GA solution.
 
-    Використовує scipy L-BFGS-B (квазі-Ньютонівський метод, аналогічний SQP
-    для обмежених задач без нелінійних обмежень).
+    L-BFGS-B is functionally equivalent to SQP for box-constrained problems
+    without nonlinear constraints. It uses a limited-memory quasi-Newton
+    approximation of the inverse Hessian.
 
-    Args:
-        initial_vector: Стартова точка від GA
-        bounds:         Межі параметрів
-        fitness_fn:     Цільова функція
-        maxiter:        Максимум ітерацій локальної оптимізації
-
-    Returns:
-        Уточнений вектор гіперпараметрів
+    Returns refined vector (or initial_vector if refinement does not improve).
     """
-    log.info("SQP уточнення (L-BFGS-B)...")
-
-    # Плавна обгортка для неперервної оптимізації
-    def smooth_fitness(v):
-        hp = HyperParams.from_vector(v)
-        return fitness_fn(hp.to_vector())
+    log.info("SQP refinement (L-BFGS-B)...")
+    initial_rmse = fitness_fn(initial_vector)
 
     result = minimize(
-        smooth_fitness,
-        x0=initial_vector,
-        method="L-BFGS-B",
-        bounds=bounds,
-        options={"maxiter": maxiter, "ftol": 1e-9},
+        fitness_fn, x0=initial_vector, method="L-BFGS-B",
+        bounds=bounds, options={"maxiter": maxiter, "ftol": 1e-9},
     )
-    log.info(f"SQP завершено: RMSE = {result.fun:.4f} | success={result.success}")
-    return result.x
+
+    if result.fun < initial_rmse:
+        log.info(f"SQP improved: {initial_rmse:.4f} -> {result.fun:.4f}")
+        return result.x
+
+    log.warning("SQP did not improve solution — keeping GA result")
+    return initial_vector
 
 
-# ─── Метрики ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     """
-    Обчислює метрики якості моделі.
+    Compute regression quality metrics.
 
-    RMSE = √(1/n · Σ(y_pred - y_true)²)
-    MAE  = 1/n · Σ|y_pred - y_true|
-    ARGE = 1/n · Σ|y_pred - y_true| / max(|y_true|, ε)
-    R²   = 1 - SS_res / SS_tot
+        RMSE = sqrt(mean((y_pred - y_true)^2))
+        MAE  = mean(|y_pred - y_true|)
+        ARGE = mean(|y_pred - y_true| / (|y_true| + eps))
+        R2   = 1 - SS_res / SS_tot
     """
     eps = 1e-9
     err = y_pred - y_true
-    rmse = float(np.sqrt(np.mean(err ** 2)))
-    mae  = float(np.mean(np.abs(err)))
-    arge = float(np.mean(np.abs(err) / (np.abs(y_true) + eps)))
-    ss_res = np.sum(err ** 2)
-    ss_tot = np.sum((y_true - y_true.mean()) ** 2)
-    r2   = float(1 - ss_res / (ss_tot + eps))
-    return {"RMSE": rmse, "MAE": mae, "ARGE": arge, "R2": r2}
+    return {
+        "RMSE": float(np.sqrt(np.mean(err**2))),
+        "MAE":  float(np.mean(np.abs(err))),
+        "ARGE": float(np.mean(np.abs(err) / (np.abs(y_true) + eps))),
+        "R2":   float(1.0 - np.sum(err**2) / (np.sum((y_true - y_true.mean())**2) + eps)),
+    }
 
 
-# ─── Головний клас HGA-LSTM ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main HGA-LSTM class
+# ---------------------------------------------------------------------------
 
 class HGALSTM:
     """
-    Головний клас HGA-LSTM моделі.
+    HGA-LSTM: Hybrid Genetic Algorithm + LSTM.
 
-    Поєднує:
-      1. Генетичний алгоритм для пошуку гіперпараметрів
-      2. SQP для локального уточнення
-      3. LSTM для прогнозування
+    Training pipeline:
+        1. GA:          Evolve population to find near-optimal hyperparameters
+        2. SQP:         L-BFGS-B local refinement of best GA solution
+        3. Final train: LSTM with optimal hyperparameters (2x epochs/patience)
 
-    Args:
-        input_size:  Кількість вхідних ознак
-        ga_cfg:      Конфігурація GA
-        train_cfg:   Конфігурація навчання
+    All features and targets are normalized to [0,1] (no data leakage:
+    scaler is fit on training set only, then applied to val/test).
 
-    Example::
-
+    Usage:
         model = HGALSTM(input_size=5)
         model.fit(X_train, y_train, X_val, y_val)
-        predictions = model.predict(X_test)
+        preds = model.predict(X_test)
         metrics = model.evaluate(X_test, y_test)
+        model.save("outputs/model.pt")
     """
 
     def __init__(
         self,
         input_size: int,
-        ga_cfg: GAConfig | None = None,
+        ga_cfg:    GAConfig    | None = None,
         train_cfg: TrainConfig | None = None,
     ):
         self.input_size = input_size
-        self.ga_cfg = ga_cfg or GAConfig()
-        self.train_cfg = train_cfg or TrainConfig()
-        self.device = self._resolve_device()
+        self.ga_cfg     = ga_cfg    or GAConfig()
+        self.train_cfg  = train_cfg or TrainConfig()
+        self.device     = self._resolve_device()
 
-        self.best_hp: HyperParams | None = None
+        self.best_hp:    HyperParams   | None = None
         self.best_model: LSTMRegressor | None = None
         self.scaler_X = MinMaxScaler()
         self.scaler_y = MinMaxScaler()
         self.ga_history: list[dict] = []
 
-        log.info(f"HGA-LSTM ініціалізовано | device={self.device} | input_size={input_size}")
+        log.info(f"HGA-LSTM | device={self.device} | input_size={input_size}")
 
     def _resolve_device(self) -> torch.device:
         if self.train_cfg.device == "auto":
             if torch.cuda.is_available():
-                name = torch.cuda.get_device_name(0)
-                log.info(f"GPU знайдено: {name}")
+                log.info(f"GPU: {torch.cuda.get_device_name(0)}")
                 return torch.device("cuda")
-            log.warning("GPU не знайдено, використовується CPU")
+            log.warning("No GPU — using CPU")
             return torch.device("cpu")
         return torch.device(self.train_cfg.device)
 
-    def fit(
-        self,
-        X_train: np.ndarray,
-        y_train: np.ndarray,
-        X_val: np.ndarray,
-        y_val: np.ndarray,
-    ) -> "HGALSTM":
-        """
-        Повний цикл навчання: GA → SQP → Фінальне навчання LSTM.
-
-        Args:
-            X_train: [N_train, features]
-            y_train: [N_train]
-            X_val:   [N_val, features]
-            y_val:   [N_val]
-
-        Returns:
-            self
-        """
+    def fit(self, X_train, y_train, X_val, y_val) -> "HGALSTM":
+        """Full training pipeline: GA -> SQP -> Final LSTM."""
         torch.manual_seed(self.train_cfg.seed)
         np.random.seed(self.train_cfg.seed)
+        random.seed(self.train_cfg.seed)
 
-        # Нормалізація
-        X_tr_s = self.scaler_X.fit_transform(X_train)
-        y_tr_s = self.scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
+        # Normalize: fit on train only (no data leakage)
+        X_tr_s  = self.scaler_X.fit_transform(X_train)
+        y_tr_s  = self.scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
         X_val_s = self.scaler_X.transform(X_val)
         y_val_s = self.scaler_y.transform(y_val.reshape(-1, 1)).flatten()
 
-        # Функція фітнесу для GA
         def fitness_fn(vector: np.ndarray) -> float:
             hp = HyperParams.from_vector(vector)
             try:
                 rmse, _ = train_evaluate(
                     hp, X_tr_s, y_tr_s, X_val_s, y_val_s,
-                    self.train_cfg, self.device, verbose=False,
+                    self.train_cfg, self.device,
                 )
-            except Exception as e:
-                log.debug(f"fitness_fn error: {e}")
+            except Exception as exc:
+                log.debug(f"fitness_fn error: {exc}")
                 return float("inf")
             return rmse
 
-        # ── Фаза 1: GA ──
-        log.info("=" * 60)
-        log.info("ФАЗА 1: Генетичний алгоритм")
-        log.info("=" * 60)
-        hp_bounds = HyperParams().BOUNDS
-        ga = GeneticAlgorithm(hp_bounds, self.ga_cfg)
+        # Phase 1: GA
+        log.info("=" * 55)
+        log.info("PHASE 1: Genetic Algorithm")
+        log.info("=" * 55)
+        ga = GeneticAlgorithm(HP_BOUNDS, self.ga_cfg)
         best_vector = ga.run(fitness_fn)
         self.ga_history = ga.history
 
-        # ── Фаза 2: SQP ──
+        # Phase 2: SQP
         if self.train_cfg.sqp_refine:
-            log.info("=" * 60)
-            log.info("ФАЗА 2: SQP уточнення")
-            log.info("=" * 60)
-            best_vector = sqp_refine(best_vector, hp_bounds, fitness_fn)
+            log.info("=" * 55)
+            log.info("PHASE 2: SQP Refinement")
+            log.info("=" * 55)
+            best_vector = sqp_refine(best_vector, HP_BOUNDS, fitness_fn)
 
         self.best_hp = HyperParams.from_vector(best_vector)
-        log.info(f"Оптимальні гіперпараметри: {asdict(self.best_hp)}")
+        log.info(f"Optimal hyperparameters: {asdict(self.best_hp)}")
 
-        # ── Фаза 3: Фінальне навчання ──
-        log.info("=" * 60)
-        log.info("ФАЗА 3: Фінальне навчання LSTM")
-        log.info("=" * 60)
+        # Phase 3: Final training with 2x epochs
+        log.info("=" * 55)
+        log.info("PHASE 3: Final LSTM Training")
+        log.info("=" * 55)
         final_cfg = TrainConfig(
             epochs=self.train_cfg.epochs * 2,
             patience=self.train_cfg.patience * 2,
@@ -625,90 +592,76 @@ class HGALSTM:
             self.best_hp, X_tr_s, y_tr_s, X_val_s, y_val_s,
             final_cfg, self.device, verbose=True,
         )
+
+        if model is None:
+            raise RuntimeError(
+                "Final LSTM training failed — check data size / hyperparameter bounds"
+            )
+
         self.best_model = model
-        log.info(f"Фінальний val RMSE (нормалізований): {rmse:.4f}")
+        log.info(f"Final val RMSE (normalized): {rmse:.4f}")
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        Прогнозує значення для нових даних.
-
-        Args:
-            X: [N, features]
-
-        Returns:
-            predictions: [N - seq_len] — у вихідних одиницях
-        """
-        assert self.best_model is not None, "Спочатку виклич .fit()"
+        """Predict targets for X. Returns array of length len(X) - seq_len."""
+        if self.best_model is None:
+            raise RuntimeError("Model not trained — call .fit() first")
         self.best_model.eval()
 
         X_s = self.scaler_X.transform(X)
-        dummy_y = np.zeros(len(X_s))
-        Xs, _ = make_sequences(X_s, dummy_y, self.best_hp.seq_len)
+        dummy = np.zeros(len(X_s), dtype=np.float32)
+        X_seq, _ = make_sequences(X_s, dummy, self.best_hp.seq_len)
 
         with torch.no_grad():
-            xv = torch.from_numpy(Xs).to(self.device)
-            preds_s = self.best_model(xv).cpu().numpy().flatten()
+            preds_norm = (self.best_model(torch.from_numpy(X_seq).to(self.device))
+                          .cpu().numpy().flatten())
 
-        return self.scaler_y.inverse_transform(preds_s.reshape(-1, 1)).flatten()
+        return self.scaler_y.inverse_transform(preds_norm.reshape(-1, 1)).flatten()
 
     def evaluate(self, X: np.ndarray, y: np.ndarray) -> dict[str, float]:
-        """
-        Обчислює метрики на тестовій вибірці.
-
-        Args:
-            X: [N, features]
-            y: [N] — справжні значення
-
-        Returns:
-            dict з RMSE, MAE, ARGE, R²
-        """
-        preds = self.predict(X)
-        y_aligned = y[self.best_hp.seq_len :]
-        metrics = compute_metrics(y_aligned, preds)
-        log.info("Метрики на тестовій вибірці:")
+        """Compute RMSE/MAE/ARGE/R2 on test data."""
+        preds     = self.predict(X)
+        y_aligned = y[self.best_hp.seq_len:]
+        metrics   = compute_metrics(y_aligned, preds)
         for k, v in metrics.items():
             log.info(f"  {k}: {v:.4f}")
         return metrics
 
     def save(self, path: str = "hga_lstm_model.pt") -> None:
-        """Зберігає модель, гіперпараметри та скейлери."""
+        """Save model, hyperparameters, and scalers to .pt file."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            "model_state": self.best_model.state_dict(),
-            "hp": asdict(self.best_hp),
-            "input_size": self.input_size,
+            "model_state":  self.best_model.state_dict(),
+            "hp":           asdict(self.best_hp),
+            "input_size":   self.input_size,
             "scaler_X_min": self.scaler_X.min_,
             "scaler_X_max": self.scaler_X.max_,
             "scaler_y_min": self.scaler_y.min_,
             "scaler_y_max": self.scaler_y.max_,
-            "ga_history": self.ga_history,
+            "ga_history":   self.ga_history,
         }, path)
-        log.info(f"Модель збережена: {path}")
+        log.info(f"Model saved: {path}")
 
     @classmethod
     def load(cls, path: str) -> "HGALSTM":
-        """Завантажує збережену модель."""
+        """Load model from .pt file for inference."""
         ckpt = torch.load(path, map_location="cpu")
-        hp = HyperParams(**ckpt["hp"])
-        input_size = ckpt["input_size"]
-
-        obj = cls(input_size=input_size)
-        obj.best_hp = hp
-        obj.best_model = LSTMRegressor(input_size, 1, hp)
+        hp   = HyperParams(**ckpt["hp"])
+        obj  = cls(input_size=ckpt["input_size"])
+        obj.best_hp    = hp
+        obj.best_model = LSTMRegressor(ckpt["input_size"], 1, hp)
         obj.best_model.load_state_dict(ckpt["model_state"])
-        obj.best_model.to(obj.device)
-
+        obj.best_model.to(obj.device).eval()
         obj.scaler_X.min_ = ckpt["scaler_X_min"]
         obj.scaler_X.max_ = ckpt["scaler_X_max"]
         obj.scaler_y.min_ = ckpt["scaler_y_min"]
         obj.scaler_y.max_ = ckpt["scaler_y_max"]
-        obj.ga_history = ckpt.get("ga_history", [])
-        log.info(f"Модель завантажена з: {path}")
+        obj.ga_history    = ckpt.get("ga_history", [])
+        log.info(f"Model loaded: {path}")
         return obj
 
     def save_ga_history(self, path: str = "ga_history.json") -> None:
-        """Зберігає історію GA для аналізу."""
+        """Save GA convergence history to JSON."""
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.ga_history, f, indent=2, ensure_ascii=False)
-        log.info(f"Історія GA збережена: {path}")
+        log.info(f"GA history saved: {path}")
