@@ -1,28 +1,23 @@
 """
-export_to_matlab.py — Експорт прогнозів HGA-LSTM у Simulink-сумісний .mat v7.3
+export_to_matlab.py — Експорт прогнозів HGA-LSTM у Simulink-сумісний .mat
 
 Готує файл eta_pred.mat для замкненої моделі MPC у Simulink (Розділ 3).
 
-ВАЖЛИВО про формат:
-    Simulink-блок From File для timeseries-даних вимагає MAT v7.3 (HDF5).
-    scipy.io.savemat пише лише v5/v7 і не підходить.
-    Тут використовується пакет hdf5storage, який створює коректний v7.3-MAT
-    із правильним заголовком 'MATLAB 7.3 MAT-file'.
+ФОРМАТ ДАНИХ для блоку From File:
+    Простий 2D-масив [N_channels+1 x N_samples]:
+        перший рядок  -> час (с)
+        наступні рядки -> значення сигналів
+    Це найбезпечніший формат, що приймається блоком From File
+    у будь-якій версії Simulink (R2020+, включно з R2026a).
 
-Що пишеться у файл (читається у MATLAB як звичайні змінні):
-    d_pred    — структура Simulink 'Structure with time' для порту md MPC
-    eta_pred  — структура з прогнозом η^ (верифікація)
-    eta_true  — структура з фактом η
+Записується через scipy.io.savemat у MAT v5 — підтримується 2D double-масивами.
+
+Змінні у файлі:
+    d_pred    — [2 x N]: рядок 1 = час, рядок 2 = прогноз d^ (для md MPC)
+    eta_pred  — [2 x N]: час + прогноз η^
+    eta_true  — [2 x N]: час + факт η
     Ts        — крок дискретизації (с)
-    metric_*  — RMSE / MAE / ARGE / R²  (скалярні змінні)
-
-Структура 'Structure with time' (саме її розпізнає блок From File):
-    sig.time            — [N x 1]
-    sig.signals.values  — [N x ch]
-    sig.signals.dimensions — ch
-
-Залежність:
-    pip install hdf5storage
+    metric_*  — RMSE / MAE / ARGE / R²
 
 Запуск:
     python src/export_to_matlab.py --self-test
@@ -40,11 +35,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import hdf5storage
+from scipy.io import savemat
 
-# ---------------------------------------------------------------------------
-# Path fix
-# ---------------------------------------------------------------------------
 _SRC = Path(__file__).parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -57,35 +49,24 @@ logging.basicConfig(
 log = logging.getLogger("HGA-LSTM.export")
 
 
-# ---------------------------------------------------------------------------
-# Simulink 'Structure with time' builder
-# ---------------------------------------------------------------------------
-
-def _sim_struct(time: np.ndarray, values: np.ndarray) -> dict:
+def _time_array(time: np.ndarray, values: np.ndarray) -> np.ndarray:
     """
-    Формує структуру Simulink 'Structure with time' як вкладений dict.
-    hdf5storage запише її у MAT v7.3 так, що Simulink розпізнає поля:
-        s.time              -> [N x 1]
-        s.signals.values    -> [N x ch]
-        s.signals.dimensions -> ch
+    Формує масив для блоку From File у форматі 'time + data rows':
+        row 0       -> time
+        rows 1..ch  -> data channels
+    Результат [(1+ch) x N], double.
     """
-    time = np.asarray(time, dtype=np.float64).reshape(-1, 1)
+    time = np.asarray(time, dtype=np.float64).ravel()
     values = np.asarray(values, dtype=np.float64)
     if values.ndim == 1:
-        values = values.reshape(-1, 1)
-    ch = values.shape[1]
-    return {
-        "time": time,
-        "signals": {
-            "values": values,
-            "dimensions": np.array([[ch]], dtype=np.float64),
-        },
-    }
+        values = values.reshape(1, -1)
+    elif values.shape[0] != len(time):
+        values = values.T
+    else:
+        values = values.T
+    # Тепер values: [ch x N], stack з часом зверху -> [(ch+1) x N]
+    return np.vstack([time.reshape(1, -1), values])
 
-
-# ---------------------------------------------------------------------------
-# Метрики
-# ---------------------------------------------------------------------------
 
 def _metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     eps = 1e-9
@@ -98,10 +79,6 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
                       / (np.sum((y_true - y_true.mean())**2) + eps)),
     }
 
-
-# ---------------------------------------------------------------------------
-# Основна логіка
-# ---------------------------------------------------------------------------
 
 def export(model_path: str, out_path: str, ts: float,
            n_samples: int, seed: int, self_test: bool) -> None:
@@ -143,7 +120,6 @@ def export(model_path: str, out_path: str, ts: float,
         d_test = d_full[-len(y_test):]
         d_pred = d_test[seq:]
 
-    # Вирівнювання довжин і час
     n = min(len(eta_true), len(eta_pred), len(d_pred))
     eta_true = np.asarray(eta_true[:n], dtype=np.float64)
     eta_pred = np.asarray(eta_pred[:n], dtype=np.float64)
@@ -156,11 +132,10 @@ def export(model_path: str, out_path: str, ts: float,
     log.info(f"Метрики η: RMSE={m['RMSE']:.4f}  MAE={m['MAE']:.4f}  "
              f"ARGE={m['ARGE']:.4f}  R2={m['R2']:.4f}")
 
-    # ── Запис у MAT v7.3 через hdf5storage ─────────────────────
     data = {
-        "d_pred":   _sim_struct(t, d_pred),
-        "eta_pred": _sim_struct(t, eta_pred),
-        "eta_true": _sim_struct(t, eta_true),
+        "d_pred":   _time_array(t, d_pred),
+        "eta_pred": _time_array(t, eta_pred),
+        "eta_true": _time_array(t, eta_true),
         "Ts":       np.array([[float(ts)]], dtype=np.float64),
     }
     for k, v in m.items():
@@ -168,17 +143,17 @@ def export(model_path: str, out_path: str, ts: float,
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    hdf5storage.write(data, filename=str(out), matlab_compatible=True,
-                      store_python_metadata=False)
+    savemat(str(out), data, do_compression=True, oned_as="column")
 
-    log.info(f"Збережено (MAT v7.3 / HDF5): {out}  "
-             f"({out.stat().st_size/1024:.1f} KB)")
-    log.info("У Simulink: блок From File -> File name: eta_pred.mat, "
-             "Variable name: d_pred")
+    log.info(f"Збережено: {out}  ({out.stat().st_size/1024:.1f} KB)")
+    log.info("У Simulink From File:")
+    log.info(f"  File name      = {out.name}")
+    log.info(f"  Variable name  = d_pred  (формат: рядок 1 = час, рядок 2 = d^)")
+    log.info(f"  Sample time    = -1 (inherited) або {ts}")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Експорт HGA-LSTM -> Simulink .mat v7.3")
+    p = argparse.ArgumentParser(description="Експорт HGA-LSTM -> Simulink .mat")
     p.add_argument("--model",     default="outputs/hga_lstm_model.pt")
     p.add_argument("--out",       default="outputs/eta_pred.mat")
     p.add_argument("--ts",        type=float, default=5.0)

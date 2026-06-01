@@ -1,4 +1,6 @@
 ./dataset_large
 ./data
 ./outputs/
+outputs/
+./outputs
 data/
