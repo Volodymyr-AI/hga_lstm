@@ -4,3 +4,5 @@
 outputs/
 ./outputs
 data/
+./__pychache__/
+__pychache__/
