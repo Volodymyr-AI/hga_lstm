@@ -89,7 +89,7 @@ def generate_synthetic_pulp_data(
     # свіже сито (runtime=0), поступово зношується до ~200 год, потім заміна.
     # Кілька повних циклів у датасеті — щоб train/val/test мали однакові
     # розподіли runtime і модель могла інтерполювати, а не екстраполювати.
-    n_cycles = 4
+    n_cycles = 10
     samples_per_cycle = n_samples // n_cycles
     screen_runtime = np.zeros(n_samples)
     for i in range(n_cycles):
