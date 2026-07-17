@@ -46,12 +46,12 @@ log = logging.getLogger("HGA-LSTM-v2")
 # Hyperparameter search space (як v1)
 # ---------------------------------------------------------------------------
 HP_BOUNDS: list[tuple[float, float]] = [
-    (16.0,  256.0),
-    (1.0,   4.0),
-    (0.0,   0.5),
-    (1e-5,  1e-2),
-    (8.0,   128.0),
-    (5.0,   50.0),
+    (16.0,  256.0), # hidden_size
+    (1.0,   4.0), # num_layers
+    (0.0,   0.5), # dropout
+    (1e-5,  1e-2), # learning_rate:  Adam optimizer
+    (8.0,   128.0), # batch_size
+    (5.0,   50.0), # seq_len
 ]
 
 
