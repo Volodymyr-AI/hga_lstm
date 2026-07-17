@@ -84,10 +84,18 @@ def generate_synthetic_pulp_data(
     pulp_flow = 150.0 + 30.0 * np.sin(t * 0.1) + rng.normal(0, 5.00, n_samples)
     solid_pct = 45.0 + 10.0 * np.sin(t * 0.25 + 1) + rng.normal(0, 2.0, n_samples)
 
-    # ── NEW v2: screen_runtime ──
-    # Сита працюють циклами: 0 -> 200 год між ТО.
-    # Для простоти беремо лінійне зростання у межах батчу.
-    screen_runtime = np.linspace(0.0, 200.0, n_samples)
+    # ── NEW v2: screen_runtime (CYCLIC — реалістичні цикли ТО) ──
+    # У реальній фабриці сита міняють раз на тиждень-два. Кожен цикл:
+    # свіже сито (runtime=0), поступово зношується до ~200 год, потім заміна.
+    # Кілька повних циклів у датасеті — щоб train/val/test мали однакові
+    # розподіли runtime і модель могла інтерполювати, а не екстраполювати.
+    n_cycles = 4
+    samples_per_cycle = n_samples // n_cycles
+    screen_runtime = np.zeros(n_samples)
+    for i in range(n_cycles):
+        start = i * samples_per_cycle
+        end   = start + samples_per_cycle if i < n_cycles - 1 else n_samples
+        screen_runtime[start:end] = np.linspace(0.0, 200.0, end - start)
 
     # ── NEW v2: motor_current ──
     # I = I_0 + k_A * amplitude + k_wear * (runtime/200) + noise
