@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     tr.add_argument("--epochs",  type=int, default=100)
     tr.add_argument("--seed",    type=int, default=42)
     tr.add_argument("--device",  default="auto", choices=["auto","cuda","cpu"])
-    tr.add_argument("--weights", nargs="+", type=float, default=[0.9, 0.1],
+    tr.add_argument("--weights", nargs="+", type=float, default=[0.7, 0.3],
                     help="Loss weights per task (must match --targets length)")
     tr.add_argument("--fast",    action="store_true",
                     help="Quick smoke test: pop=6, gen=5, epochs=20")
