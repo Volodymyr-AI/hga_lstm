@@ -265,7 +265,7 @@ def train_evaluate(
         betas=(0.9, 0.999), eps=1e-8,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=5, factor=0.5, verbose=False,
+        optimizer, mode="min", patience=5, factor=0.5,
     )
     criterion = nn.MSELoss()
 
