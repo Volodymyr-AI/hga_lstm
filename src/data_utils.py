@@ -141,10 +141,10 @@ def generate_synthetic_pulp_data(
     optimal_beta = 40.9 + beta_drift
     G_ang  = np.exp(-((angle - optimal_beta) ** 2) / (2 * 4.0**2))
     
-    efficiency = (81.4 * G_amp * G_freq * G_ang
+    efficiency = (55.0 + 40.0 * G_amp * G_freq * G_ang
                   * (1.0 - 0.001 * np.abs(solid_pct - 40.0))
                   + noise_std * 2 * rng.normal(0, 1, n_samples))
-    efficiency = np.clip(efficiency, 40.0, 97.0)
+    efficiency = np.clip(efficiency, 30.0, 97.0)
 
     df = pd.DataFrame({
         # Старі стовпці (для зворотної сумісності зі single-task v1)
