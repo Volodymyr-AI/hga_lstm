@@ -78,9 +78,18 @@ def generate_synthetic_pulp_data(
     rng = np.random.default_rng(seed)
     t   = np.linspace(0, 4 * np.pi, n_samples)
 
-    # ── Operational parameters (як раніше, без змін) ──
-    amplitude = 3.5 + 0.5 * np.sin(t * 0.3)  + rng.normal(0, 0.10, n_samples)
-    frequency = 13.0 + 1.0 * np.cos(t * 0.2)  + rng.normal(0, 0.20, n_samples)
+    # ── Operational parameters (v2.1: розширені діапазони для варіативності η) ──
+    # Раніше діапазони були надто вузькі навколо оптимумів гаусіан у формулі η,
+    # через що η майже не варіювала і мережа вчилась вигадувати константу.
+    # Тепер параметри повний робочий діапазон з п. 2.6.4 обмежень:
+    #   amplitude: 2-8 мм (обмеження MPC MV(2))
+    #   frequency: 12-25 Гц (обмеження MPC MV(1))
+    amplitude = 4.5 + 2.0 * np.sin(t * 0.3) + rng.normal(0, 0.30, n_samples)
+    amplitude = np.clip(amplitude, 2.0, 8.0)
+
+    frequency = 17.0 + 5.0 * np.cos(t * 0.2) + rng.normal(0, 0.5, n_samples)
+    frequency = np.clip(frequency, 12.0, 25.0)
+
     pulp_flow = 150.0 + 30.0 * np.sin(t * 0.1) + rng.normal(0, 5.00, n_samples)
     solid_pct = 45.0 + 10.0 * np.sin(t * 0.25 + 1) + rng.normal(0, 2.0, n_samples)
 
