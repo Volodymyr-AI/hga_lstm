@@ -1,12 +1,12 @@
 """
 data_utils.py — Data utilities for HGA-LSTM (v2: multi-task ready)
 
-ЗМІНИ v2 (для Розділу 3, рекомендаційна підсистема β):
-    + Додано синтез motor_current (А) — струм вібродвигуна
-    + Додано синтез screen_runtime (год) — напрацювання сита від ТО
-    + Кут ексцентрика angle_deg тепер залежить від runtime і струму:
-      оптимальний β дрейфує зі зношеністю сита; струм вносить флуктуацію
-      через нерівномірність завантаження.
+CHANGES v2 (for Section 3, recommendation subsystem β):
+    + Added synthesis of motor_current (A) — vibrating motor current
+    + Added synthesis of screen_runtime (h) — screen operating time since last maintenance
+    + Eccentric angle (angle_deg) now depends on runtime and current:
+      optimal β drifts with screen wear; current introduces fluctuations
+      due to uneven loading.
 
 Contains:
     - Synthetic pulp data generator (physics-based, з motor_current/runtime)
@@ -43,7 +43,7 @@ def generate_synthetic_pulp_data(
                        where G_x = exp(-(x - x_opt)^2 / (2*sigma_x^2))
                        Optimal: A=3.7mm, f=13.4Hz, beta=40.9 deg
 
-    NEW v2:
+    v2:
         Motor current:    I = I_0 + k_A * amplitude + k_w * wear + noise
                           I_0=8.0 A, k_A=0.6 A/mm, k_w=0.5 A
         Screen runtime:   runtime = linspace(0, 200, n) — сита працюють до 200 год
@@ -78,12 +78,12 @@ def generate_synthetic_pulp_data(
     rng = np.random.default_rng(seed)
     t   = np.linspace(0, 4 * np.pi, n_samples)
 
-    # ── Operational parameters (v2.1: розширені діапазони для варіативності η) ──
-    # Раніше діапазони були надто вузькі навколо оптимумів гаусіан у формулі η,
-    # через що η майже не варіювала і мережа вчилась вигадувати константу.
-    # Тепер параметри повний робочий діапазон з п. 2.6.4 обмежень:
-    #   amplitude: 2-8 мм (обмеження MPC MV(2))
-    #   frequency: 12-25 Гц (обмеження MPC MV(1))
+    # ── Operational parameters (v2.1: expanded ranges for η variability) ──
+    # Previously, the ranges were too narrow around the Gaussian optima in the η formula,
+    # causing η to barely vary and the network to learn to output a constant value.
+    # Now, the parameters cover the full operating range from constraint section 2.6.4:
+    #   amplitude: 2–8 mm (MPC MV(2) constraint)
+    #   frequency: 12–25 Hz (MPC MV(1) constraint)
     amplitude = 4.5 + 2.0 * np.sin(t * 0.3) + rng.normal(0, 0.30, n_samples)
     amplitude = np.clip(amplitude, 2.0, 8.0)
 
@@ -93,11 +93,12 @@ def generate_synthetic_pulp_data(
     pulp_flow = 150.0 + 30.0 * np.sin(t * 0.1) + rng.normal(0, 5.00, n_samples)
     solid_pct = 45.0 + 10.0 * np.sin(t * 0.25 + 1) + rng.normal(0, 2.0, n_samples)
 
-    # ── NEW v2: screen_runtime (CYCLIC — реалістичні цикли ТО) ──
-    # У реальній фабриці сита міняють раз на тиждень-два. Кожен цикл:
-    # свіже сито (runtime=0), поступово зношується до ~200 год, потім заміна.
-    # Кілька повних циклів у датасеті — щоб train/val/test мали однакові
-    # розподіли runtime і модель могла інтерполювати, а не екстраполювати.
+    # ──v2: screen_runtime (CYCLIC — realistic maintenance cycles) ──
+    # In a real factory, screens are replaced every 1–2 weeks. Each cycle:
+    # a fresh screen (runtime=0) gradually wears down over ~200 hours, then is replaced.
+    # Multiple full cycles are included in the dataset so that the train, validation,
+    # and test sets share the same runtime distributions, allowing the model
+    # to interpolate rather than extrapolate.
     n_cycles = 10
     samples_per_cycle = n_samples // n_cycles
     screen_runtime = np.zeros(n_samples)
@@ -135,12 +136,11 @@ def generate_synthetic_pulp_data(
                + noise_std * rng.normal(0, 1, n_samples))
     density = np.clip(density, 1.05, 1.85)
 
-    # ── Screening efficiency (як раніше, з оновленим angle) ──
-    G_amp  = np.exp(-((amplitude - 3.7) ** 2) / (2 * 0.5**2))
-    G_freq = np.exp(-((frequency - 13.4) ** 2) / (2 * 0.7**2))
-    # Зверни увагу: оптимум β тепер дрейфує — використовуємо поточний optimal_beta
+    G_amp  = np.exp(-((amplitude - 3.7) ** 2) / (2 * 1.5**2))
+    G_freq = np.exp(-((frequency - 13.4) ** 2) / (2 * 3.0**2))
     optimal_beta = 40.9 + beta_drift
     G_ang  = np.exp(-((angle - optimal_beta) ** 2) / (2 * 4.0**2))
+    
     efficiency = (81.4 * G_amp * G_freq * G_ang
                   * (1.0 - 0.001 * np.abs(solid_pct - 40.0))
                   + noise_std * 2 * rng.normal(0, 1, n_samples))
