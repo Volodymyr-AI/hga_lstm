@@ -78,21 +78,6 @@ def generate_synthetic_pulp_data(
     rng = np.random.default_rng(seed)
     t   = np.linspace(0, 4 * np.pi, n_samples)
 
-    # ── Operational parameters (v2.1: expanded ranges for η variability) ──
-    # Previously, the ranges were too narrow around the Gaussian optima in the η formula,
-    # causing η to barely vary and the network to learn to output a constant value.
-    # Now, the parameters cover the full operating range from constraint section 2.6.4:
-    #   amplitude: 2–8 mm (MPC MV(2) constraint)
-    #   frequency: 12–25 Hz (MPC MV(1) constraint)
-    amplitude = 4.5 + 2.0 * np.sin(t * 0.3) + rng.normal(0, 0.30, n_samples)
-    amplitude = np.clip(amplitude, 2.0, 8.0)
-
-    frequency = 17.0 + 5.0 * np.cos(t * 0.2) + rng.normal(0, 0.5, n_samples)
-    frequency = np.clip(frequency, 12.0, 25.0)
-
-    pulp_flow = 150.0 + 30.0 * np.sin(t * 0.1) + rng.normal(0, 5.00, n_samples)
-    solid_pct = 45.0 + 10.0 * np.sin(t * 0.25 + 1) + rng.normal(0, 2.0, n_samples)
-
     # ──v2: screen_runtime (CYCLIC — realistic maintenance cycles) ──
     # In a real factory, screens are replaced every 1–2 weeks. Each cycle:
     # a fresh screen (runtime=0) gradually wears down over ~200 hours, then is replaced.
@@ -106,6 +91,11 @@ def generate_synthetic_pulp_data(
         start = i * samples_per_cycle
         end   = start + samples_per_cycle if i < n_cycles - 1 else n_samples
         screen_runtime[start:end] = np.linspace(0.0, 200.0, end - start)
+    phase = (screen_runtime / 200.0 ) * 2 *np.pi
+    amplitude = np.clip(4.5 + 2.0 * np.sin(phase * 1.3) + rng.normal(0, 0.30, n_samples), 2.0, 8.0)
+    frequency = np.clip(17.0 + 5.0 * np.cos(phase * 1.1) + rng.normal(0, 0.5, n_samples), 12.0, 25.0)
+    pulp_flow = 150.0 + 30.0 * np.sin(phase * 0.9) + rng.normal(0, 5.00, n_samples)
+    solid_pct = 45.0 + 10.0 * np.sin(phase * 1.5 + 1) + rng.normal(0, 2.0, n_samples)
 
     # ── NEW v2: motor_current ──
     # I = I_0 + k_A * amplitude + k_wear * (runtime/200) + noise
@@ -124,7 +114,7 @@ def generate_synthetic_pulp_data(
     # У реальному житті оператор підбирає β інтуїтивно — наша задача навчити
     # LSTM знаходити цю залежність із runtime та motor_current.
     beta_drift = 3.0 * (screen_runtime / 200.0)              # дрейф оптимуму
-    beta_noise = 0.5 * np.sin(t * 0.4)                       # повільні коливання
+    beta_noise = 0.5 * np.sin(phase * 2.0)                   # повільні коливання
     beta_current_corr = 0.3 * (motor_current - 10.5)         # коригування за струмом
     angle = (40.9 + beta_drift + beta_noise + beta_current_corr
              + rng.normal(0, 0.5, n_samples))
